@@ -1,0 +1,796 @@
+AWSTemplateFormatVersion: '2010-09-09'
+
+Parameters:
+  AmazonEmailID:
+    Type: String
+    Description: 'Enter your amazon email id'
+    AllowedPattern: '^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$'
+  EnablePhoneNotification: 
+    Type: String
+    Description: Enter yes if you want to receive notification on phone and have verified your number in sandbox
+    AllowedValues: ['yes', 'no']
+  PhoneNumber:
+    Type: String
+    Description: Enter your phone number with country code if you have entered yes in EnablePhoneNotification Parameter
+    Default: '+919876543210'
+  NotificationFrequency:
+    Type: String
+    Description: Enter the frequency of the notification
+    Default: '15'
+Conditions: 
+  InNorthVirginia:
+    Fn::Equals:
+      - Ref: 'AWS::Region'
+      - 'us-east-1'
+  CreateSMSSubscription: !And
+    - Fn::Equals:
+        - !Ref EnablePhoneNotification
+        - 'yes'
+    - !Condition InNorthVirginia
+Resources:
+  ConfigCheckValidationNotificationTopic:
+    Condition: InNorthVirginia
+    Type: 'AWS::SNS::Topic'
+    Properties:
+      DisplayName: ConfigCheckValidationNotificationTopic
+      TopicName: ConfigCheckValidation
+# Subscribe an email to the SNS Topic
+  ConfigCheckValidationNotificationTopicSubscription:
+    Condition: InNorthVirginia
+    Type: 'AWS::SNS::Subscription'
+    Properties:
+      Protocol: 'email'
+      Endpoint: !Ref AmazonEmailID # Replace this with the desired email address
+      TopicArn: !Ref ConfigCheckValidationNotificationTopic
+# Subscribe an SMS to the SNS Topic
+  ConfigCheckValidationSMSNotificationTopicSubscription:
+    Condition: CreateSMSSubscription
+    Type: 'AWS::SNS::Subscription'
+    Properties:
+      Protocol: 'sms'
+      Endpoint: !Ref PhoneNumber # Replace this with the desired phone number
+      TopicArn: !Ref ConfigCheckValidationNotificationTopic
+
+
+# Lambda functions checks all the security group in the region which have any public inbound access and is attached to any resource
+  OpenSecurityGroupLambdaRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - 'lambda.amazonaws.com'
+            Action:
+              - 'sts:AssumeRole'
+      Policies:
+        - PolicyName: OpenSecurityGroupLambdaRolePolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'logs:CreateLogGroup'
+                  - 'logs:CreateLogStream'
+                  - 'logs:PutLogEvents'
+                Resource: 'arn:aws:logs:*:*:*'
+              - Effect: Allow
+                Action:
+                  - 'ec2:DescribeSecurityGroups'
+                  - 'ec2:DescribeNetworkInterfaces'
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - 'config:GetResourceConfigHistory'
+                  - 'config:PutEvaluations'
+                Resource: '*'
+  
+  OpenSecurityGroupLambdaFunctionInvokePermission:
+    Type: 'AWS::Lambda::Permission'
+    Properties:
+      Action: 'lambda:InvokeFunction'
+      FunctionName: !GetAtt OpenSecurityGroupLambdaFunction.Arn
+      Principal: 'config.amazonaws.com'
+      SourceAccount: !Ref 'AWS::AccountId'
+
+  OpenSecurityGroupLambdaFunction:
+    Type: 'AWS::Lambda::Function'
+    Properties: 
+      FunctionName: OpenSecurityGroupLambda
+      Handler: 'index.lambda_handler'
+      Runtime: 'python3.10'
+      Timeout: 60
+      Role: !GetAtt OpenSecurityGroupLambdaRole.Arn
+      Code:
+        ZipFile: !Sub |
+          import boto3
+          import json
+          from botocore.exceptions import ClientError
+          region = '${AWS::Region}'
+          account_id = '${AWS::AccountId}'
+          ec2_client = boto3.client('ec2')
+          config_client = boto3.client('config')
+
+          def lambda_handler(event, context):
+              invoking_event = json.loads(event['invokingEvent'])
+              # print(event['invokingEvent'])
+
+              resource_id_value = invoking_event['configurationItem']['resourceId']
+              resource_name_value = invoking_event['configurationItem']['resourceName']
+              resource_type_value = invoking_event['configurationItem']['resourceType']
+              ordering_timestamp_value = invoking_event['configurationItem']['configurationItemCaptureTime']
+              result_token_value = event['resultToken']
+              
+              change_type_value = ''
+              if(invoking_event.get('configurationItemDiff')):
+                  change_type_value = invoking_event['configurationItemDiff']['changeType']
+                  
+              ip_permissions_value = []
+              if change_type_value != 'DELETE':
+                  ip_permissions_value = invoking_event['configurationItem']['configuration']['ipPermissions']
+
+                  
+              security_group_data = {
+                  'resource_id': resource_id_value,
+                  'resource_name': resource_name_value,
+                  'resource_type': resource_type_value,
+                  'ordering_timestamp': ordering_timestamp_value,
+                  'change_type': change_type_value,
+                  'result_token': result_token_value
+              }
+              # print(security_group_data)
+                  
+              compliance_value = 'COMPLIANT'
+              
+              attached_security_group_ids_set = describe_network_interfaces()
+              if change_type_value != 'DELETE' and security_group_data['resource_id'] in attached_security_group_ids_set:
+                  compliance_value = evaluate_security_group(security_group_data, ip_permissions_value)
+                  
+              try:
+                  put_evaluation(security_group_data, compliance_value)
+              except ClientError as e:
+                  print(f"Error: {e}")
+
+          def describe_network_interfaces():
+              response = ec2_client.describe_network_interfaces()
+              attached_security_group_ids_set = set()
+              for network_interface in response['NetworkInterfaces']:
+                  groups = network_interface.get('Groups', [])
+                  for group in groups:
+                      group_id = group.get('GroupId')
+                      if group_id:
+                          attached_security_group_ids_set.add(group_id)
+              # print(attached_security_group_ids_set)
+              return attached_security_group_ids_set
+
+          def evaluate_security_group(security_group_data, ip_permissions_value):
+              # print(ip_permissions_value)
+              for permission in ip_permissions_value:
+                  if((permission['toPort'] != 80 and permission['toPort'] != 443) and ('0.0.0.0/0' in [ip_v4_range['cidrIp'] for ip_v4_range in permission['ipv4Ranges']] or '::/0' in [ip_v6_range['cidrIpv6'] for ip_v6_range in permission['ipv6Ranges']])):
+                      return 'NON_COMPLIANT'
+              return 'COMPLIANT'
+
+          def put_evaluation(security_group_data, compliance_value):
+              config_client.put_evaluations(
+                  Evaluations=[
+                      {
+                          'ComplianceResourceType': security_group_data['resource_type'],
+                          'ComplianceResourceId': security_group_data['resource_id'],
+                          'ComplianceType': compliance_value,
+                          'OrderingTimestamp': security_group_data['ordering_timestamp']
+                      }
+                  ],
+                  ResultToken=security_group_data['result_token'],
+              )
+
+
+  OpenSecurityGroupConfigRule:
+    Type: 'AWS::Config::ConfigRule'
+    Properties:
+      ConfigRuleName: OpenSecurityGroupConfigRule
+      Description: 'Evaluate security groups with inbound rules open to 0.0.0.0/0 for any protocol.'
+      Scope:
+        ComplianceResourceTypes:
+          - 'AWS::EC2::SecurityGroup'
+      Source:
+        Owner: CUSTOM_LAMBDA
+        SourceIdentifier: !GetAtt OpenSecurityGroupLambdaFunction.Arn
+        SourceDetails:
+          - EventSource: aws.config
+            MessageType: ConfigurationItemChangeNotification
+    DependsOn : OpenSecurityGroupLambdaFunctionInvokePermission
+
+# Public RDS Public Access Config Check
+  RDSLambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      Policies:
+        - PolicyName: LambdaExecutionPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: "*"
+              - Effect: Allow
+                Action:
+                  - rds:DescribeDBInstances
+                  - config:PutEvaluations
+                Resource: "*"
+
+  RDSPublicLambdaFunctionInvokePermission:
+    Type: 'AWS::Lambda::Permission'
+    Properties:
+      Action: 'lambda:InvokeFunction'
+      FunctionName: !GetAtt RDSPublicAccessCheckLambda.Arn
+      Principal: 'config.amazonaws.com'
+      SourceAccount: !Ref 'AWS::AccountId'
+  
+  RDSPublicAccessCheckLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: RDSPublicAccessCheck
+      Runtime: python3.10
+      Timeout: 60
+      Handler: index.lambda_handler
+      Role: !GetAtt RDSLambdaExecutionRole.Arn
+      Code:
+        ZipFile: !Sub |
+          import json
+          import boto3
+          from botocore.exceptions import ClientError
+
+          region = '${AWS::Region}'
+          account_id = '${AWS::AccountId}'
+          rds = boto3.client('rds')
+
+          config = boto3.client('config')
+
+          def evaluate_compliance(instance):
+              print("Instance Config: ", instance)
+              if (instance['PubliclyAccessible'] == True):
+                  print("Resource is PubliclyAccessible")
+                  return 'NON_COMPLIANT'
+              print("Resource is not publically accessible.")
+              return 'COMPLIANT'
+
+          def lambda_handler(event, context):
+              print("Event: ", event)
+              invoking_event = json.loads(event['invokingEvent'])
+              compliance_value = 'COMPLIANT'
+              resource_id = invoking_event['configurationItem']['resourceId']
+              resource_name = invoking_event['configurationItem']['resourceName']
+              resource_type = invoking_event['configurationItem']['resourceType']
+              change_type_value = ''
+              
+              
+              if(invoking_event.get('configurationItemDiff')):
+                  change_type_value = invoking_event['configurationItemDiff']['changeType']
+              if change_type_value != 'DELETE' :    
+                  if resource_type == 'AWS::RDS::DBInstance':
+                      instance = rds.describe_db_instances(DBInstanceIdentifier=resource_name)['DBInstances'][0]
+                      compliance_value = evaluate_compliance(instance)      
+
+              try:
+                  response = config.put_evaluations(
+                      Evaluations=[
+                          {
+                              'ComplianceResourceType': resource_type,
+                              'ComplianceResourceId': resource_id,
+                              'ComplianceType': compliance_value,
+                              'OrderingTimestamp': invoking_event['configurationItem']['configurationItemCaptureTime']
+                          },
+                      ],
+                      ResultToken=event['resultToken']
+                  )
+              except ClientError as e:
+                  print(f"Error: {e}")
+
+
+
+
+  RDSPublicAccessConfigRule:
+    Type: AWS::Config::ConfigRule
+    Properties:
+      ConfigRuleName: RDSPublicAccessCheck
+      Description: Checks for publicly accessible RDS instances and triggers SNS notifications
+      Scope:
+        ComplianceResourceTypes:
+          - "AWS::RDS::DBInstance"
+      Source:
+        Owner: CUSTOM_LAMBDA
+        SourceIdentifier: !GetAtt RDSPublicAccessCheckLambda.Arn
+        SourceDetails:
+          - EventSource: aws.config
+            MessageType: ConfigurationItemChangeNotification
+    DependsOn: RDSPublicLambdaFunctionInvokePermission
+
+# Dangling CloudFront
+  CloudfrontS3OriginNonExistentBucket:
+    Condition: InNorthVirginia
+    Type: "AWS::Config::ConfigRule"
+    Properties:
+      ConfigRuleName: "cloudfront-s3-origin-non-existent-bucket"
+      Scope:
+        ComplianceResourceTypes: ['AWS::CloudFront::Distribution']
+      Description: "Checks if Amazon CloudFront distributions point to a non-existent S3 bucket. The rule is NON_COMPLIANT if `S3OriginConfig` for a CloudFront distribution points to a non-existent S3 bucket. The rule does not evaluate S3 buckets with static website hosting."
+      Source:
+        Owner: "AWS"
+        SourceIdentifier: "CLOUDFRONT_S3_ORIGIN_NON_EXISTENT_BUCKET"
+      MaximumExecutionFrequency: "One_Hour"
+
+# Lambda Function URL with NONE Auth Validation
+  OpenLambdaFunctionUrlConfigRule:
+    Type: 'AWS::Config::ConfigRule'
+    Properties:
+      ConfigRuleName: OpenLambdaFunctionUrlConfigRule
+      Description: 'Evaluate Lambda functions URL configured with Auth Type as NONE.'
+      Scope:
+        ComplianceResourceTypes:
+          - 'AWS::Lambda::Function'
+      Source:
+        Owner: CUSTOM_LAMBDA
+        SourceIdentifier: !GetAtt OpenLambdaFunctionUrlCheckFunction.Arn
+        SourceDetails:
+          - EventSource: aws.config
+            MessageType: ConfigurationItemChangeNotification
+    DependsOn: OpenLambdaFunctionUrlFunctionInvokePermission
+  
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      Policies:
+        - PolicyName: LambdaExecutionPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: "*"
+              - Effect: Allow
+                Action:
+                  - lambda:ListFunctions
+                  - lambda:GetFunction
+                  - lambda:GetFunctionUrlConfig
+                  - lambda:ListFunctionUrlConfigs
+                  - lambda:GetPolicy
+                  - config:PutEvaluations
+                  - sns:Publish
+                Resource: "*"
+
+  OpenLambdaFunctionUrlFunctionInvokePermission:
+    Type: 'AWS::Lambda::Permission'
+    Properties:
+      Action: 'lambda:InvokeFunction'
+      FunctionName: !GetAtt OpenLambdaFunctionUrlCheckFunction.Arn
+      Principal: 'config.amazonaws.com'
+      SourceAccount: !Ref 'AWS::AccountId'
+  
+  OpenLambdaFunctionUrlCheckFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: LambdaPublicFunctionUrlCheck
+      Timeout: 60
+      Environment:
+        Variables:
+          REGION: !Ref 'AWS::Region'
+          ACCOUNT_ID: !Ref 'AWS::AccountId'
+      Runtime: nodejs16.x
+      Handler: index.handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Code:
+        ZipFile: |
+          const AWS = require('aws-sdk');
+          var region = process.env.REGION;
+          var account_id = process.env.ACCOUNT_ID;
+          AWS.config.update({ region: region });
+          const client = new AWS.Lambda();
+          const configClient = new AWS.ConfigService();
+
+          exports.handler = async (event, context) => {
+              
+              let invokingEvent = JSON.parse(event.invokingEvent);
+              let changeTypeValue = '';
+              if(!!invokingEvent.configurationItemDiff)
+                  changeTypeValue = invokingEvent.configurationItemDiff.changeType;
+              let resourceNameValue = invokingEvent.configurationItem.resourceName;
+              let resourceARNValue = invokingEvent.configurationItem.ARN;
+
+              const functionData = {
+                  FunctionName: resourceNameValue,
+                  FunctionARN: resourceARNValue,
+                  ChangeTypeValue: changeTypeValue
+              }
+              // console.log("functionData", functionData)
+              
+              let functionOpenToWorld = false;
+
+              if(changeTypeValue !== 'DELETE') {
+                  let input = {
+                      FunctionName: functionData.FunctionName
+                  }
+                  // console.log(input);
+                  
+                  let singleFunctionUrlData = await client.listFunctionUrlConfigs(input).promise();
+                  if (singleFunctionUrlData.FunctionUrlConfigs && singleFunctionUrlData.FunctionUrlConfigs.length > 0) {
+                      if (singleFunctionUrlData.FunctionUrlConfigs[0].AuthType == 'NONE') {
+                          functionOpenToWorld = true;
+                      }
+                  }
+                  
+                  try {
+                      let policyData = await client.getPolicy(input).promise();
+                      if (policyData.Policy) {
+                          let parsedPolicy = JSON.parse(policyData.Policy);
+                          if (parsedPolicy && parsedPolicy.Statement.length > 0) {
+                              for (let statement of parsedPolicy.Statement) {
+                                  if (statement.Sid == "FunctionURLAllowPublicAccess") {
+                                      if (!functionOpenToWorld) {
+                                          functionOpenToWorld = true;
+                                      }
+                                  }
+                              }
+                          }
+                      }
+                  }
+                  catch(e) {
+                      console.log("Policy not found");
+                  }
+              }   
+              console.log("Function open to world", functionOpenToWorld);
+                  
+              try {
+                  let complianceTypeValue = "COMPLIANT";
+                  if(functionOpenToWorld) complianceTypeValue = "NON_COMPLIANT";
+                  
+                  let input2 = {
+                      Evaluations: [
+                          {
+                              ComplianceResourceType: "AWS::Lambda::Function", 
+                              ComplianceResourceId: functionData.FunctionARN,
+                              ComplianceType: complianceTypeValue,
+                              Annotation: "Custome lambda rule identified",
+                              OrderingTimestamp: new Date(),
+                          },
+                      ],
+                      ResultToken: event.resultToken,
+                      TestMode: false
+                  };
+                  const response = await configClient.putEvaluations(input2).promise();
+                  // console.log(response);
+              }
+              catch (e) {
+                  console.log("Config error : ",e);
+              }
+          }
+
+# RDS SNAPSHOT PUBLIC PROHIBITED
+  PublicallyRestorableRDSSnapshotLambdaRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - 'lambda.amazonaws.com'
+            Action:
+              - 'sts:AssumeRole'
+      Policies:
+        - PolicyName: PublicallyRestorableEBSLambdaRolePolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'logs:CreateLogGroup'
+                  - 'logs:CreateLogStream'
+                  - 'logs:PutLogEvents'
+                Resource: 'arn:aws:logs:*:*:*'
+              - Effect: Allow
+                Action:
+                  - 'rds:DescribeDBClusterSnapshotAttributes'
+                  - 'rds:DescribeDBSnapshotAttributes'
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - 'config:GetResourceConfigHistory'
+                  - 'config:PutEvaluations'
+                Resource: '*'
+  
+  PublicallyRestorableRDSSnapshotLambdaInvokePermission:
+    Type: 'AWS::Lambda::Permission'
+    Properties:
+      Action: 'lambda:InvokeFunction'
+      FunctionName: !GetAtt PublicallyRestorableRDSSnapshotLambdaFunction.Arn
+      Principal: 'config.amazonaws.com'
+      SourceAccount: !Ref 'AWS::AccountId'
+
+  PublicallyRestorableRDSSnapshotLambdaFunction:
+    Type: 'AWS::Lambda::Function'
+    Properties: 
+      FunctionName: PublicallyRestorableRDSSnapshot
+      Handler: 'index.lambda_handler'
+      Runtime: 'python3.10'
+      Timeout: 60
+      Role: !GetAtt PublicallyRestorableRDSSnapshotLambdaRole.Arn
+      Code:
+        ZipFile: !Sub |
+          import json
+          import boto3
+          rds = boto3.client('rds')
+          config = boto3.client('config')
+          from botocore.exceptions import ClientError
+          def lambda_handler(event, context):
+              print("Event: ", event)
+
+              invoking_event = json.loads(event['invokingEvent'])
+              # invoking_event = event
+              print("Invoking Event: ", invoking_event)
+              resource_id = invoking_event['configurationItem']['resourceId']
+              resource_name = invoking_event['configurationItem']['resourceName']
+              resource_type = invoking_event['configurationItem']['resourceType']
+              change_type_value = ''
+              response = ''
+              snapshot_attributes = None
+              attribute_var = ''
+              compliance_value = "COMPLIANT"
+              if(resource_type == "AWS::RDS::DBClusterSnapshot"):
+                  attribute_var = 'DBClusterSnapshotAttributes'
+              else : 
+                  attribute_var = 'DBSnapshotAttributes'
+              if(invoking_event.get('configurationItemDiff')):
+                  change_type_value = invoking_event['configurationItemDiff']['changeType']
+              
+              if change_type_value != 'DELETE':    
+                  if(invoking_event['configurationItem']['supplementaryConfiguration'] and invoking_event['configurationItem']['supplementaryConfiguration'][attribute_var] ):
+                      snapshot_attributes = invoking_event['configurationItem']['supplementaryConfiguration'][attribute_var]
+              
+                  print("Snapshot Attributes: ", snapshot_attributes)
+                  if(snapshot_attributes):
+                      for snapshot_attribute in snapshot_attributes :
+                          if(snapshot_attribute['attributeName'] == 'restore' and (len(snapshot_attribute['attributeValues']) > 0 and snapshot_attribute['attributeValues'][0] == 'all')):
+                              compliance_value = 'NON_COMPLIANT'
+                  else:
+                      if resource_type == 'AWS::RDS::DBClusterSnapshot':
+                          response = rds.describe_db_cluster_snapshot_attributes(
+                              DBClusterSnapshotIdentifier= resource_name
+                          )
+              
+                      elif resource_type == 'AWS::RDS::DBSnapshot':
+                          response = rds.describe_db_snapshot_attributes(
+                              DBSnapshotIdentifier= resource_name
+                          )
+                      print("Response: ", response)
+                      snapshot_attributes = response['DBSnapshotAttributesResult'][attribute_var]
+                      if(snapshot_attributes):
+                          for snapshot_attribute in snapshot_attributes:
+                              if(snapshot_attribute['AttributeName'] == 'restore' and (len(snapshot_attribute['AttributeValues']) > 0 and snapshot_attribute['attributeValues'][0] == 'all')):
+                                  compliance_value = 'NON_COMPLIANT'
+              try:
+                  response = config.put_evaluations(
+                      Evaluations=[
+                          {
+                              'ComplianceResourceType': resource_type,
+                              'ComplianceResourceId': resource_id,
+                              'ComplianceType': compliance_value,
+                              'OrderingTimestamp': invoking_event['configurationItem']['configurationItemCaptureTime']
+                          },
+                      ],
+                      ResultToken=event['resultToken']
+                  )
+              except ClientError as e:
+                  print(f"Error: {e}")
+
+
+
+  PublicallyRestorableRDSSnapshotConfigRule:
+    Type: 'AWS::Config::ConfigRule'
+    Properties:
+      ConfigRuleName: PublicallyRestorableRDSSnapshot
+      Description: 'Checks if Amazon Relational Database Service (Amazon RDS) snapshots are public. The rule is NON_COMPLIANT if any existing and new Amazon RDS snapshots are public.'
+      Scope:
+        ComplianceResourceTypes:
+          - 'AWS::RDS::DBSnapshot'
+          - 'AWS::RDS::DBClusterSnapshot'
+      Source:
+        Owner: CUSTOM_LAMBDA
+        SourceIdentifier: !GetAtt PublicallyRestorableRDSSnapshotLambdaFunction.Arn
+        SourceDetails:
+          - EventSource: aws.config
+            MessageType: ConfigurationItemChangeNotification
+    DependsOn: PublicallyRestorableRDSSnapshotLambdaInvokePermission
+
+
+# EBS Public Snapshot Check 
+  ConfigRuleEBSSnapshot:
+    Type: "AWS::Config::ConfigRule"
+    Properties:
+      ConfigRuleName: "ebs-snapshot-public-restorable-check"
+      Scope:
+        ComplianceResourceTypes: []
+      Description: "A Config rule that checks whether Amazon Elastic Block Store snapshots are not publicly restorable. The rule is NON_COMPLIANT if one or more snapshots with the RestorableByUserIds field is set to all. If this field is set to all, then Amazon EBS snapsh..."
+      Source:
+        Owner: "AWS"
+        SourceIdentifier: "EBS_SNAPSHOT_PUBLIC_RESTORABLE_CHECK"
+      MaximumExecutionFrequency: "One_Hour"
+
+# IAM role for Lambda Function to notify users in case of any non-compiant rules
+  NotifyNonComplianceLambdaFunctionRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - 'lambda.amazonaws.com'
+            Action:
+              - 'sts:AssumeRole'
+      Policies:
+        - PolicyName: NotifyNonComplianceLambdaFunctionPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'logs:CreateLogGroup'
+                  - 'logs:CreateLogStream'
+                  - 'logs:PutLogEvents'
+                Resource: 'arn:aws:logs:*:*:*'
+              - Effect: Allow
+                Action:
+                  - 'sns:Publish'
+                Resource: !Sub "arn:aws:sns:us-east-1:${AWS::AccountId}:ConfigCheckValidation"
+              - Effect: Allow
+                Action: 
+                  - config:GetComplianceDetailsByConfigRule
+                Resource: 
+                  - !GetAtt OpenSecurityGroupConfigRule.Arn   # Resources to be updated
+                  - !GetAtt ConfigRuleEBSSnapshot.Arn
+                  - !GetAtt RDSPublicAccessConfigRule.Arn
+                  - !GetAtt PublicallyRestorableRDSSnapshotConfigRule.Arn
+                  - !If [ InNorthVirginia, !GetAtt CloudfrontS3OriginNonExistentBucket.Arn, 'arn:aws:config:us-east-1:012345678901:config-rule/config-rule']
+                  - !GetAtt OpenLambdaFunctionUrlConfigRule.Arn
+
+# Lambda Function to notify users in case of any non-compiant rules
+  NotifyNonComplianceLambdaFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: NotifyNonComplianceLambdaFunction
+      Timeout: 60
+      Environment:
+        Variables:
+          SNS_TOPIC_REGION: 'us-east-1'
+      Handler: 'index.lambda_handler'
+      Runtime: 'python3.10'
+      Role: !GetAtt NotifyNonComplianceLambdaFunctionRole.Arn
+      Code:
+        ZipFile: !Sub |
+          import boto3
+          import os
+          from botocore.exceptions import ClientError
+          region = '${AWS::Region}'
+          account_id = '${AWS::AccountId}'
+          user = '${AmazonEmailID}'
+          sns_topic_region = os.environ.get('SNS_TOPIC_REGION')
+          sns_client = boto3.client('sns', region_name='us-east-1')
+          sns_topic_arn = f'arn:aws:sns:{sns_topic_region}:{account_id}:ConfigCheckValidation'
+          ec2_client = boto3.client('ec2')
+          config_client = boto3.client('config')
+
+
+          ConfigRulesToMonitor = [
+              {
+                'name': "OpenSecurityGroupConfigRule",
+                'issue': "Security Group having 0.0.0.0/0 inbound access" 
+              },
+              {
+                'name': 'PublicallyRestorableRDSSnapshot',
+                'issue' : "RDS Snapshot is Publicly Restorable" # Add Issue
+              },
+              {
+                'name': 'RDSPublicAccessCheck',
+                'issue': 'RDS Instance with Public Access'
+              },
+              {
+                'name': 'OpenLambdaFunctionUrlConfigRule',
+                'issue': 'Lambda Function Url open to Public'
+              },
+              {
+                'name': "ebs-snapshot-public-restorable-check",
+                'issue': "EBS Snapshot is publicly restorable"
+              }
+            ]
+
+
+          def lambda_handler(event, context):
+            if region == 'us-east-1':
+              cloudfront_rule = {
+                'name': 'cloudfront-s3-origin-non-existent-bucket',
+                'issue': 'Cloudfront Distribution with non-existent S3 origin'
+              }
+              ConfigRulesToMonitor.append(cloudfront_rule)
+
+            print("Event:", event)
+            notificationText = f"Hi {user.split('@')[0]}, Please take appropriate action to remediate non-compliance across following resources in {account_id} within {region}: \n"
+            notifyComplianceStatus = False
+            for configRule in ConfigRulesToMonitor:
+              complianceDetails = config_client.get_compliance_details_by_config_rule(
+                  ConfigRuleName= configRule['name'],
+                  ComplianceTypes=[
+                      'NON_COMPLIANT',
+                  ],
+                  Limit=10
+              )
+              print("Response:", complianceDetails['EvaluationResults'])
+              if(len(complianceDetails['EvaluationResults']) > 0):
+                notifyComplianceStatus = True
+                for evaluationResult in complianceDetails['EvaluationResults']:
+                  print("Resource Type: ",evaluationResult['EvaluationResultIdentifier']['EvaluationResultQualifier']['ResourceType'])
+                  print("ResourceId: ",evaluationResult['EvaluationResultIdentifier']['EvaluationResultQualifier']['ResourceId'])
+                  resourceType = evaluationResult['EvaluationResultIdentifier']['EvaluationResultQualifier']['ResourceType']
+                  resourceId = evaluationResult['EvaluationResultIdentifier']['EvaluationResultQualifier']['ResourceId']
+                  notificationText += f"{resourceType} ->  {resourceId} -> " + configRule['issue'] + '\n'
+            print("Notification Text:" , notificationText)
+            if(notifyComplianceStatus):
+              send_sns_notification(notificationText)
+
+          def send_sns_notification(message):
+            try:
+                response = sns_client.publish(
+                    TopicArn=sns_topic_arn,
+                    Subject = f"Palisade Check Notification for {user.split('@')[0]}",
+                    Message=message
+                )
+            except ClientError as e:
+                print(f"Error sending SNS notification: {e}")
+              
+# Eventbridge Rule that gets triggered every hour to trigger Non-Compliance notification Lambda function
+  NonComplianceLambdaTriggerRule:
+    Type: AWS::Events::Rule
+    Properties: 
+      Description: Eventbridge Rule that gets triggered every hour to trigger Non-Compliance notification Lambda function
+      Name: NonComplianceLambdaTriggerRule
+      # RoleArn: !GetAtt NonComplianceLambdaTriggerRuleRole.Arn
+      ScheduleExpression: !Sub "rate(${NotificationFrequency} minutes)"
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt NotifyNonComplianceLambdaFunction.Arn
+          Id: "target-id-1"
+
+  EventBridgeLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !GetAtt NotifyNonComplianceLambdaFunction.Arn
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt NonComplianceLambdaTriggerRule.Arn
